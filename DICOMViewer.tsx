@@ -55,6 +55,8 @@ const DICOMViewer = ({ caseId, isActive = true, reconRefreshToken }: DICOMViewer
   const { addSlice } = useFilmingContext()
   const { volume, metadata: frontendMetadata, files: frontendFiles, isLoading: filesLoading } = useFrontendDicomContext()
   const currentSliceRef = useRef(0)
+  const totalSlicesRef = useRef(0)
+  const sliceRafRef = useRef<number | null>(null)
   const loadedStackKeyRef = useRef<string | null>(null)
   const baseParallelScaleRef = useRef<number | null>(null)
   const hasRefreshedAfterTabSwitchRef = useRef(false)
@@ -111,6 +113,19 @@ const DICOMViewer = ({ caseId, isActive = true, reconRefreshToken }: DICOMViewer
   useEffect(() => {
     currentSliceRef.current = currentSlice
   }, [currentSlice])
+  useEffect(() => {
+    totalSlicesRef.current = totalSlices
+  }, [totalSlices])
+
+  // Batched React state update — coalesces rapid slice changes into one re-render per frame.
+  // Cornerstone viewport is updated synchronously at call site; this only syncs the UI (slider, labels).
+  const deferSetCurrentSlice = useCallback((slice: number) => {
+    if (sliceRafRef.current !== null) cancelAnimationFrame(sliceRafRef.current)
+    sliceRafRef.current = requestAnimationFrame(() => {
+      sliceRafRef.current = null
+      setCurrentSlice(slice)
+    })
+  }, [])
 
   const fitToScreen = useCallback(() => {
     try {
@@ -739,76 +754,46 @@ const DICOMViewer = ({ caseId, isActive = true, reconRefreshToken }: DICOMViewer
   }, [show4WindowView, totalSlices])
 
   // Update all 4-window viewports when slice changes
+  // Uses requestAnimationFrame to batch the 4 viewport updates into one paint frame.
+  const fourWindowRafRef = useRef<number | null>(null)
   useEffect(() => {
     if (!show4WindowView || !renderingEngineRef.current || totalSlices === 0) {
       return
     }
+    // Cancel any pending RAF so fast scrolling doesn't queue multiple updates
+    if (fourWindowRafRef.current !== null) cancelAnimationFrame(fourWindowRafRef.current)
 
-    const update4WindowSlices = async () => {
-      try {
-        // Wait for viewports to be initialized
-        if (!fourWindowViewportsReadyRef.current) {
-          // Wait a bit and retry
-          await new Promise(resolve => setTimeout(resolve, 200))
-          if (!fourWindowViewportsReadyRef.current) {
-            // Still not ready, skip this update
-            return
+    fourWindowRafRef.current = requestAnimationFrame(() => {
+      fourWindowRafRef.current = null
+      if (!fourWindowViewportsReadyRef.current) return
+
+      const renderingEngine = renderingEngineRef.current
+      if (!renderingEngine) return
+
+      const imageIds = cornerstoneImageIdsRef.current
+      if (!imageIds || imageIds.length === 0) return
+
+      const slice = currentSliceRef.current
+
+      for (const preset of windowPresets) {
+        const viewportId = `dicom-viewer-viewport-${preset.name.toLowerCase().replace(' ', '-')}`
+        const vp = renderingEngine.getViewport(viewportId) as any
+        if (!vp) continue
+        try {
+          if (typeof vp.setImageIdIndex === 'function') {
+            vp.setImageIdIndex(slice)
           }
-        }
-
-        const renderingEngine = renderingEngineRef.current
-        if (!renderingEngine) return
-
-        const imageIds = cornerstoneImageIdsRef.current
-        if (!imageIds || imageIds.length === 0) {
-          return
-        }
-
-        // Update each 4-window viewport
-        for (const preset of windowPresets) {
-          const viewportId = `dicom-viewer-viewport-${preset.name.toLowerCase().replace(' ', '-')}`
-          const vp = renderingEngine.getViewport(viewportId) as any
-          if (!vp) {
-            // Viewport might not be ready yet, skip silently (will be updated on next slice change)
-            continue
-          }
-
-          try {
-            // Update slice - prefer setImageIdIndex for performance
-            if (typeof vp.setImageIdIndex === 'function') {
-              vp.setImageIdIndex(currentSlice)
-            } else {
-              // Fallback: set stack again
-              await vp.setStack(imageIds, currentSlice)
-            }
-            
-            // Calculate VOI range from window/level
-            const lower = preset.center - preset.width / 2
-            const upper = preset.center + preset.width / 2
-            
-            // Ensure window/level is still applied (in case it was reset)
-            vp.setProperties({
-              voiRange: { lower, upper }
-            })
-            
-            // Also call setVOI if available
-            if (typeof vp.setVOI === 'function') {
-              vp.setVOI({ lower, upper })
-            }
-            
-            // Render the viewport
-            vp.render()
-          } catch (err) {
-            console.warn(`[DICOMViewer] Failed to update viewport ${preset.name}:`, err)
-          }
-        }
-      } catch (err) {
-        console.error('[DICOMViewer] Failed to update 4-window slices:', err)
+          const lower = preset.center - preset.width / 2
+          const upper = preset.center + preset.width / 2
+          vp.setProperties({ voiRange: { lower, upper } })
+          if (typeof vp.setVOI === 'function') vp.setVOI({ lower, upper })
+          vp.render()
+        } catch (_) { /* skip */ }
       }
+    })
+    return () => {
+      if (fourWindowRafRef.current !== null) cancelAnimationFrame(fourWindowRafRef.current)
     }
-
-    // Update slices - the function already handles waiting for viewports
-    update4WindowSlices()
   }, [show4WindowView, currentSlice, totalSlices])
 
   // Track previous 4-window view state to detect exit
@@ -1471,7 +1456,7 @@ const DICOMViewer = ({ caseId, isActive = true, reconRefreshToken }: DICOMViewer
           if (detail?.viewportId === 'dicom-viewer-viewport' && detail?.range) {
             const { lower, upper } = detail.range
             const imageIds = cornerstoneImageIdsRef.current
-            const currentImageId = imageIds?.[currentSlice] || imageIds?.[0] || ''
+            const currentImageId = imageIds?.[currentSliceRef.current] || imageIds?.[0] || ''
             const isWadouri = typeof currentImageId === 'string' && currentImageId.startsWith('wadouri:')
 
             const slope = metadata?.rescale?.slope ?? 1
@@ -1502,13 +1487,14 @@ const DICOMViewer = ({ caseId, isActive = true, reconRefreshToken }: DICOMViewer
         }
 
         // Handler for stack image change (slice navigation via scroll)
+        // Skip if the slice already matches ref to avoid feedback loops from our own
+        // setImageIdIndex calls, which would trigger extra re-renders and lag.
         const handleStackNewImage = (evt: any) => {
           const { detail } = evt
           if (detail?.viewportId === 'dicom-viewer-viewport' && detail?.imageIdIndex !== undefined) {
             const newSliceIndex = detail.imageIdIndex
-            console.log('[DICOMViewer] CS3D slice changed:', newSliceIndex)
-            
-            // Update React state (this will trigger custom canvas re-render)
+            if (newSliceIndex === currentSliceRef.current) return // already set by us
+            currentSliceRef.current = newSliceIndex
             setCurrentSlice(newSliceIndex)
           }
         }
@@ -2281,32 +2267,28 @@ const DICOMViewer = ({ caseId, isActive = true, reconRefreshToken }: DICOMViewer
   }, [isActive, totalSlices, loadDicomData]) // Only depend on isActive and totalSlices for triggering
   
 
-  // Update viewport when slice changes - USE ONLY CORNERSTONE3D (no custom canvas)
+  // Update viewport when slice changes - fast path, no unnecessary work.
+  // setImageIdIndex already triggers an internal render; we only restore camera
+  // if Cornerstone reset zoom/pan (StackViewport keeps camera by default).
   const updateCornerstoneSlice = useCallback((sliceIndex: number) => {
-    if (cornerstoneImageIdsRef.current.length === 0) {
-      return
-    }
+    const imageIds = cornerstoneImageIdsRef.current
+    if (imageIds.length === 0 || sliceIndex < 0 || sliceIndex >= imageIds.length) return
 
-    if (sliceIndex < 0 || sliceIndex >= cornerstoneImageIdsRef.current.length) {
-      return
-    }
+    const viewport = renderingEngineRef.current?.getViewport('dicom-viewer-viewport') as any
+    if (!viewport) return
 
-    // Use ONLY Cornerstone3D for rendering - removes flicker from dual rendering
-    if (renderingEngineRef.current) {
-    const viewport = renderingEngineRef.current.getViewport('dicom-viewer-viewport') as any
-      if (viewport) {
-        // Save current camera before slice change to preserve zoom/pan
-        const currentCamera = viewport.getCamera ? viewport.getCamera() : null
-        
-        // Change slice
+    // Snapshot camera so we can detect if Cornerstone resets zoom/pan
+    const cam = viewport.getCamera?.()
+    const prevScale = cam?.parallelScale
+
     viewport.setImageIdIndex(sliceIndex)
-        
-        // Restore camera (zoom/pan) after slice change to prevent reset
-        if (currentCamera && viewport.setCamera) {
-          viewport.setCamera(currentCamera)
-        }
-        
-    viewport.render()
+
+    // Only restore camera if parallelScale was reset (some CS3D versions reset it)
+    if (prevScale !== undefined && cam) {
+      const newCam = viewport.getCamera?.()
+      if (newCam && Math.abs(newCam.parallelScale - prevScale) > 0.01) {
+        viewport.setCamera(cam)
+        viewport.render()
       }
     }
   }, [])
@@ -2321,11 +2303,10 @@ const DICOMViewer = ({ caseId, isActive = true, reconRefreshToken }: DICOMViewer
       const viewport = renderingEngineRef.current.getViewport('dicom-viewer-viewport') as any
       if (viewport) {
         const imageIds = cornerstoneImageIdsRef.current
-        const currentImageId = imageIds?.[currentSlice] || imageIds?.[0] || ''
+        // Use ref for currentSlice so this callback is NOT recreated on every scroll
+        const currentImageId = imageIds?.[currentSliceRef.current] || imageIds?.[0] || ''
 
         // Cornerstone VOI expects values in the same space as the pixel data.
-        // - dicomlocal: pixels are already HU (our custom loader)
-        // - wadouri: pixels are typically stored values; rescale slope/intercept convert to HU
         const slope = metadata?.rescale?.slope ?? 1
         const intercept = metadata?.rescale?.intercept ?? 0
         const isWadouri = typeof currentImageId === 'string' && currentImageId.startsWith('wadouri:')
@@ -2339,26 +2320,23 @@ const DICOMViewer = ({ caseId, isActive = true, reconRefreshToken }: DICOMViewer
         viewport.setProperties({
           voiRange: { lower, upper }
         })
-        console.log(`[DICOMViewer] Set VOI via voiRange: lower=${lower}, upper=${upper} (isWadouri=${isWadouri})`)
 
         if (typeof viewport.setVOI === 'function') {
           viewport.setVOI({ lower, upper })
-          console.log(`[DICOMViewer] Also set VOI via setVOI (voiRange): lower=${lower}, upper=${upper} (isWadouri=${isWadouri})`)
         }
 
-        // Apply invert using CSS filter on canvas (Cornerstone3D doesn't have built-in invert)
+        // Apply invert using CSS filter on canvas
         const canvas = viewport.element?.querySelector('canvas')
         if (canvas) {
           canvas.style.filter = isInverted ? 'invert(1)' : 'none'
         }
 
         viewport.render()
-        console.log(`[DICOMViewer] Cornerstone window/level updated: WW=${windowWidth}, WC=${windowCenter}, Invert=${isInverted} (isWadouri=${isWadouri})`)
       }
     } catch (err) {
       console.error(`[DICOMViewer] Failed to update Cornerstone window/level:`, err)
     }
-  }, [windowWidth, windowCenter, metadata, currentSlice, isInverted])
+  }, [windowWidth, windowCenter, metadata, isInverted])
 
   // Update Cornerstone zoom when it changes
   const updateCornerstoneZoom = useCallback(async () => {
@@ -2411,12 +2389,9 @@ const DICOMViewer = ({ caseId, isActive = true, reconRefreshToken }: DICOMViewer
     }
   }, [zoom, activeTool])
 
-  // Update slice in Cornerstone when currentSlice changes
-  useEffect(() => {
-    if (cornerstoneInitializedRef.current) {
-      updateCornerstoneSlice(currentSlice)
-    }
-  }, [currentSlice, updateCornerstoneSlice])
+  // NOTE: Slice viewport updates are now done IMMEDIATELY at the call site
+  // (handleWheel, handleSliceChange, playback, drag) — no useEffect needed.
+  // This eliminates the 1-frame delay that made scrolling feel laggy.
 
   // Update window/level when it changes - USE ONLY CORNERSTONE3D
   useEffect(() => {
@@ -2445,27 +2420,16 @@ const DICOMViewer = ({ caseId, isActive = true, reconRefreshToken }: DICOMViewer
     }
   }, [zoom, updateCornerstoneZoom])
 
-  // Handle slice navigation - update ref synchronously so wheel handler always sees latest slice
+  // Handle slice navigation (slider, buttons). Updates viewport immediately for fast, smooth UI.
   const handleSliceChange = useCallback((newSlice: number) => {
-    const maxSlices = totalSlices
-
-    if (maxSlices <= 0) {
-      console.warn('[DICOMViewer] Cannot change slice: no slices available', { totalSlices })
-      return
-    }
-
-    const minSlice = 0
-    const maxSlice = maxSlices - 1
-
-    const clampedSlice = Math.max(minSlice, Math.min(newSlice, maxSlice))
-
-    const prevSlice = currentSliceRef.current
-    if (prevSlice !== clampedSlice) {
-      console.log(`[DICOMViewer] Changing slice: ${prevSlice} -> ${clampedSlice} (range: ${minSlice}-${maxSlice})`)
-      currentSliceRef.current = clampedSlice
-      setCurrentSlice(clampedSlice)
-    }
-  }, [totalSlices])
+    const maxSlices = totalSlicesRef.current
+    if (maxSlices <= 0) return
+    const clampedSlice = Math.max(0, Math.min(newSlice, maxSlices - 1))
+    if (clampedSlice === currentSliceRef.current) return
+    currentSliceRef.current = clampedSlice
+    updateCornerstoneSlice(clampedSlice)
+    deferSetCurrentSlice(clampedSlice)
+  }, [updateCornerstoneSlice, deferSetCurrentSlice])
 
   // Get pixel coordinates from mouse position (Cornerstone3D only)
   const getPixelCoordinates = useCallback(async (e: React.MouseEvent): Promise<{ x: number; y: number; pixelX: number; pixelY: number } | null> => {
@@ -2542,7 +2506,6 @@ const DICOMViewer = ({ caseId, isActive = true, reconRefreshToken }: DICOMViewer
     
     // Handle annotation tools
     if (activeTool === 'arrow' || activeTool === 'line' || activeTool === 'circle' || activeTool === 'rectangle') {
-      console.log('Starting annotation:', activeTool, pixelCoords)
       const newAnnotation: Annotation = {
         id: `ann-${Date.now()}`,
         type: activeTool,
@@ -2550,7 +2513,7 @@ const DICOMViewer = ({ caseId, isActive = true, reconRefreshToken }: DICOMViewer
         color: annotationColor,
         strokeWidth: 2,
         createdAt: Date.now(),
-        sliceIndex: currentSlice
+        sliceIndex: currentSliceRef.current
       }
       setActiveAnnotation(newAnnotation)
       setIsDragging(true) // Enable dragging for annotation tools
@@ -2570,7 +2533,7 @@ const DICOMViewer = ({ caseId, isActive = true, reconRefreshToken }: DICOMViewer
         fill: true,
         fillOpacity: 0.2,
         createdAt: Date.now(),
-        sliceIndex: currentSlice
+        sliceIndex: currentSliceRef.current
       }
       setActiveAnnotation(newAnnotation)
       setIsDragging(true) // Enable dragging for freehand
@@ -2600,7 +2563,7 @@ const DICOMViewer = ({ caseId, isActive = true, reconRefreshToken }: DICOMViewer
     setIsDragging(true)
     setDragStart({ x: e.clientX, y: e.clientY })
     setDragStartValues({ ww: windowWidth, wc: windowCenter, panX, panY, zoom })
-  }, [windowWidth, windowCenter, panX, panY, zoom, activeTool, getPixelCoordinates, currentMeasurement, measurements, calculateDistance, annotationColor, currentSlice, annotations])
+  }, [windowWidth, windowCenter, panX, panY, zoom, activeTool, getPixelCoordinates, currentMeasurement, measurements, calculateDistance, annotationColor, annotations])
 
   // Calculate HU value from Cornerstone image data (no backend needed)
   const calculateHUValue = useCallback(async (pixelX: number, pixelY: number) => {
@@ -2623,14 +2586,15 @@ const DICOMViewer = ({ caseId, isActive = true, reconRefreshToken }: DICOMViewer
         return
       }
 
-      // Get the current imageId from the stack
+      // Get the current imageId from the stack (use ref to avoid recreating on every scroll)
       const imageIds = cornerstoneImageIdsRef.current
-      if (currentSlice < 0 || currentSlice >= imageIds.length) {
+      const slice = currentSliceRef.current
+      if (slice < 0 || slice >= imageIds.length) {
         setHUValue(null)
         return
       }
 
-      const imageId = imageIds[currentSlice]
+      const imageId = imageIds[slice]
       
       // Get the image from Cornerstone cache
       const csCore = await import('@cornerstonejs/core')
@@ -2680,7 +2644,7 @@ const DICOMViewer = ({ caseId, isActive = true, reconRefreshToken }: DICOMViewer
       console.error('[DICOMViewer] Failed to calculate HU value:', error)
         setHUValue(null)
       }
-  }, [metadata, currentSlice])
+  }, [metadata])
 
   // Mouse move handler
   const handleMouseMove = useCallback(async (e: React.MouseEvent) => {
@@ -2768,16 +2732,23 @@ const DICOMViewer = ({ caseId, isActive = true, reconRefreshToken }: DICOMViewer
       const deltaY = e.clientY - dragStart.y
       
       switch (activeTool) {
-        case 'scroll':
-          // Vertical drag = scroll through slices (use ref for responsive updates)
-          const sliceDelta = Math.round(deltaY / 10)
-          handleSliceChange(currentSliceRef.current + sliceDelta)
+        case 'scroll': {
+          // Vertical drag = scroll through slices (ref + immediate viewport update for smooth drag)
+          const total = totalSlicesRef.current
+          if (total <= 0) break
+          const sliceDelta = Math.round(deltaY / 8)
+          const nextSlice = Math.max(0, Math.min(currentSliceRef.current + sliceDelta, total - 1))
+          if (nextSlice === currentSliceRef.current) break
+          currentSliceRef.current = nextSlice
+          updateCornerstoneSlice(nextSlice)
+          deferSetCurrentSlice(nextSlice)
           break
+        }
       }
     } catch (error) {
       console.error('Error in handleMouseMove:', error)
     }
-  }, [isDragging, dragStart, dragStartValues, activeTool, handleSliceChange, getPixelCoordinates, currentMeasurement, calculateHUValue, metadata, activeAnnotation])
+  }, [isDragging, dragStart, dragStartValues, activeTool, updateCornerstoneSlice, getPixelCoordinates, currentMeasurement, calculateHUValue, metadata, activeAnnotation])
 
   // Mouse up handler
   const handleMouseUp = useCallback(() => {
@@ -2801,21 +2772,30 @@ const DICOMViewer = ({ caseId, isActive = true, reconRefreshToken }: DICOMViewer
     setIsDragging(false)
   }, [activeAnnotation])
 
-  // Scroll wheel handler - use ref so rapid scroll sees latest slice immediately
+  // Scroll wheel handler - handles both slice scrolling and zoom
+  // Uses refs + immediate viewport update for fast, smooth slice changes.
+  // deltaMode/deltaY: trackpads send pixel deltas (deltaMode 0) - step multiple slices for speed.
   const handleWheel = useCallback((e: WheelEvent) => {
     e.preventDefault()
     e.stopPropagation() // Prevent Cornerstone from also handling this
-
+    
     if (e.ctrlKey) {
       // Ctrl + wheel = zoom
       const zoomDelta = e.deltaY > 0 ? 0.9 : 1.1
       setZoom(prev => Math.max(0.1, Math.min(10, prev * zoomDelta)))
     } else {
-      // Regular wheel = scroll slices (use ref to avoid stale closure on rapid scroll)
-      const delta = e.deltaY > 0 ? 1 : -1
-      handleSliceChange(currentSliceRef.current + delta)
+      const total = totalSlicesRef.current
+      if (total <= 0) return
+      // Mouse wheel: 1 notch = 1 slice (deltaMode 1 sends ~3 lines, deltaMode 0 sends ~100-120px)
+      // Always step exactly 1 slice per wheel tick for precise control
+      const step = e.deltaY > 0 ? 1 : -1
+      const nextSlice = Math.max(0, Math.min(currentSliceRef.current + step, total - 1))
+      if (nextSlice === currentSliceRef.current) return
+      currentSliceRef.current = nextSlice
+      updateCornerstoneSlice(nextSlice)
+      deferSetCurrentSlice(nextSlice)
     }
-  }, [handleSliceChange])
+  }, [updateCornerstoneSlice, deferSetCurrentSlice])
 
   useEffect(() => {
     const container = containerRef.current
@@ -3388,7 +3368,7 @@ const DICOMViewer = ({ caseId, isActive = true, reconRefreshToken }: DICOMViewer
 
     console.log('[DICOMViewer] ✅ Canvas capture complete, annotations drawn:', sliceAnnotations.length)
     return canvas.toDataURL('image/png')
-  }, [currentSlice, annotations, measurements, metadata, windowWidth, windowCenter])
+  }, [annotations, measurements, metadata, windowWidth, windowCenter])
 
   // Save current slice to film with annotations and windowing
   const handleSaveToFilm = useCallback(async () => {
@@ -3403,11 +3383,7 @@ const DICOMViewer = ({ caseId, isActive = true, reconRefreshToken }: DICOMViewer
     }
     
     try {
-      console.log('[DICOMViewer] Capturing slice for film...', {
-        currentSlice,
-        hasMetadata: !!metadata,
-        hasRenderingEngine: !!renderingEngineRef.current
-      })
+      const sliceForFilm = currentSliceRef.current
       
       // Capture the slice with annotations and windowing applied
       let capturedImage: string
@@ -3450,14 +3426,13 @@ const DICOMViewer = ({ caseId, isActive = true, reconRefreshToken }: DICOMViewer
       console.log('[DICOMViewer] Slice captured successfully, length:', capturedImage.length)
       
       // Get current slice annotations and measurements
-      const sliceAnnotations = annotations.filter(a => a.sliceIndex === currentSlice)
+      const sliceAnnotations = annotations.filter(a => a.sliceIndex === sliceForFilm)
       const sliceMeasurements = measurements.filter(m => true) // Measurements don't have sliceIndex
       
       // Save with annotations and measurements
-      // Use the actual caseId prop, not patient_id from metadata
       addSlice({
         caseId: caseId || metadata.uids?.patient_id || 'unknown',
-        sliceIndex: currentSlice,
+        sliceIndex: sliceForFilm,
         imageUrl: capturedImage, // Use captured image with annotations
         windowWidth: windowWidth,
         windowCenter: windowCenter,
@@ -3474,20 +3449,12 @@ const DICOMViewer = ({ caseId, isActive = true, reconRefreshToken }: DICOMViewer
       })
       
       // Show notification
-      setToastMessage(`Slice ${currentSlice + 1} saved to film`)
-      console.log('[DICOMViewer] ✅ Slice saved to film successfully')
+      setToastMessage(`Slice ${sliceForFilm + 1} saved to film`)
     } catch (error: any) {
-      console.error('[DICOMViewer] ❌ Failed to capture slice:', error)
-      console.error('[DICOMViewer] Error details:', {
-        message: error?.message,
-        stack: error?.stack,
-        hasRenderingEngine: !!renderingEngineRef.current,
-        hasMetadata: !!metadata,
-        currentSlice
-      })
+      console.error('[DICOMViewer] Failed to capture slice:', error)
       setToastMessage(`Failed to save slice: ${error?.message || 'Unknown error'}`)
     }
-  }, [caseId, currentSlice, metadata, windowWidth, windowCenter, zoom, addSlice, captureSliceWithAnnotations, annotations, measurements])
+  }, [caseId, metadata, windowWidth, windowCenter, zoom, addSlice, captureSliceWithAnnotations, annotations, measurements])
 
   // Reset view
   const resetView = async () => {
@@ -3604,22 +3571,16 @@ const DICOMViewer = ({ caseId, isActive = true, reconRefreshToken }: DICOMViewer
       }
       setIsPlaying(false)
     } else {
-      // Start manual playback
-      const maxSlices = totalSlices
-      if (maxSlices <= 0) {
-        console.warn('[DICOMViewer] Cannot play: no slices available')
-        return
-      }
-      
+      // Start manual playback (ref + immediate viewport update for smooth playback)
+      const maxSlices = totalSlicesRef.current
+      if (maxSlices <= 0) return
       setIsPlaying(true)
-      const minSlice = 0
       const maxSlice = maxSlices - 1
-      
       playIntervalRef.current = setInterval(() => {
-        setCurrentSlice(prev => {
-          const next = prev + 1
-          return next > maxSlice ? minSlice : next
-        })
+        const next = currentSliceRef.current + 1 > maxSlice ? 0 : currentSliceRef.current + 1
+        currentSliceRef.current = next
+        updateCornerstoneSlice(next)
+        deferSetCurrentSlice(next)
       }, 1000 / fps)
     }
   }
@@ -3779,7 +3740,7 @@ const DICOMViewer = ({ caseId, isActive = true, reconRefreshToken }: DICOMViewer
       console.error('Error converting pixel to screen:', error)
       return null
     }
-  }, [metadata, zoom, panX, panY, currentSlice])
+  }, [metadata, zoom, panX, panY])
 
   // Draw measurement overlay
   const drawMeasurement = useCallback((measurement: Measurement, isCurrent: boolean = false) => {
@@ -4583,14 +4544,14 @@ const DICOMViewer = ({ caseId, isActive = true, reconRefreshToken }: DICOMViewer
           
           <div className="flex gap-1 mt-2">
             <button
-              onClick={() => handleSliceChange(currentSlice - 1)}
+              onClick={() => handleSliceChange(currentSliceRef.current - 1)}
               disabled={currentSlice <= effectiveMin}
               className="flex-1 px-2 py-1.5 bg-slate-800 text-slate-300 rounded text-xs hover:bg-slate-700 disabled:opacity-50"
             >
               ▲ Prev
             </button>
             <button
-              onClick={() => handleSliceChange(currentSlice + 1)}
+              onClick={() => handleSliceChange(currentSliceRef.current + 1)}
               disabled={currentSlice >= effectiveMax}
               className="flex-1 px-2 py-1.5 bg-slate-800 text-slate-300 rounded text-xs hover:bg-slate-700 disabled:opacity-50"
             >
