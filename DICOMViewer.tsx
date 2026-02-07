@@ -1149,7 +1149,21 @@ const DICOMViewer = ({ caseId, isActive = true, reconRefreshToken }: DICOMViewer
         }
         
         console.log('[DICOMViewer] Stack set with', sortedImageIds.length, 'images, showing slice 0')
-        
+
+        // Preload all slices in background for smooth scrolling (batch of 5)
+        ;(async () => {
+          try {
+            const BATCH = 5
+            for (let i = 0; i < sortedImageIds.length; i += BATCH) {
+              const chunk = sortedImageIds.slice(i, i + BATCH)
+              await Promise.all(chunk.map((id: string) => csCore.imageLoader.loadAndCacheImage(id).catch(() => null)))
+            }
+            console.log('[DICOMViewer] All slices preloaded into cache')
+          } catch {
+            // ignore
+          }
+        })()
+
         // Get image window/level values for initial state
           const firstImage = csCore.cache.getImage(sortedImageIds[0])
           const imgWW = firstImage?.windowWidth || 1475
@@ -1375,6 +1389,21 @@ const DICOMViewer = ({ caseId, isActive = true, reconRefreshToken }: DICOMViewer
 
       viewport.render()
       console.log('[DICOMViewer] Backend stack loaded:', { slices: imageIds.length })
+
+      // Preload all slices in background for smooth scrolling (batch of 5 to avoid network overload)
+      ;(async () => {
+        try {
+          const csCore = await import('@cornerstonejs/core')
+          const BATCH = 5
+          for (let i = 0; i < imageIds.length; i += BATCH) {
+            const chunk = imageIds.slice(i, i + BATCH)
+            await Promise.all(chunk.map((id: string) => csCore.imageLoader.loadAndCacheImage(id).catch(() => null)))
+          }
+          console.log('[DICOMViewer] All slices preloaded into cache')
+        } catch {
+          // ignore
+        }
+      })()
 
       // After layout settles (right panel / tabs), fit again so the slice is perfectly centered.
       // This avoids the slight off-center you can see right after case load.
@@ -2137,13 +2166,42 @@ const DICOMViewer = ({ caseId, isActive = true, reconRefreshToken }: DICOMViewer
     }
   }, [isActive, caseId, frontendFiles?.length, volume, frontendMetadata, filesLoading, loadDicomData, totalSlices, reconRefreshToken])
   
+  // Clear Cornerstone image + volume cache (call before recon reload or case switch)
+  const clearCornerstoneCache = useCallback(async () => {
+    try {
+      const csCore = await import('@cornerstonejs/core')
+      const { cache } = csCore as any
+      if (!cache) return
+
+      if (typeof cache.purgeCache === 'function') {
+        cache.purgeCache()
+        console.log('[DICOMViewer] Cornerstone cache purged')
+      } else if (typeof cache.purgeVolumeCache === 'function') {
+        cache.purgeVolumeCache()
+      }
+
+      if (typeof cache.getVolumes === 'function') {
+        const volumes = cache.getVolumes()
+        for (const vol of volumes) {
+          try {
+            if (cache.removeVolumeLoadObject) {
+              cache.removeVolumeLoadObject(vol.volumeId)
+            }
+          } catch {}
+        }
+      }
+    } catch (e) {
+      console.warn('[DICOMViewer] Cache clear error:', e)
+    }
+  }, [])
+
   // Reload when reconstruction is applied
   useEffect(() => {
     if (reconRefreshToken && caseId && isActive) {
       const savedSlice = currentSliceRef.current
-      console.log('[DICOMViewer] Reconstruction applied, reloading DICOM data... (preserving slice:', savedSlice, ')')
+      console.log('[DICOMViewer] Reconstruction applied, clearing cache and reloading DICOM... (preserving slice:', savedSlice, ')')
       loadedStackKeyRef.current = null // Force reload
-      loadDicomData().then(() => {
+      clearCornerstoneCache().then(() => loadDicomData()).then(() => {
         const stackKey = `backend:${caseId}`
         loadedStackKeyRef.current = stackKey
         
@@ -2162,7 +2220,7 @@ const DICOMViewer = ({ caseId, isActive = true, reconRefreshToken }: DICOMViewer
         }, 100)
       })
     }
-  }, [reconRefreshToken, caseId, isActive, loadDicomData])
+  }, [reconRefreshToken, caseId, isActive, loadDicomData, clearCornerstoneCache])
 
   // Reset the refresh flag when tab becomes inactive
   useEffect(() => {
@@ -4573,3 +4631,5 @@ const DICOMViewer = ({ caseId, isActive = true, reconRefreshToken }: DICOMViewer
 }
 
 export default DICOMViewer
+
+  
